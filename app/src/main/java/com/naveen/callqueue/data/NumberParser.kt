@@ -76,6 +76,18 @@ object NumberParser {
         if (digits.length == 12 && digits.startsWith("91")) digits = digits.substring(2)
         if (digits.length == 13 && digits.startsWith("091")) digits = digits.substring(3)
 
+        // Broken +91 prefix: the "91" lost a digit when the list was typed or copied, leaving
+        // "1" or "9" in front of a 10-digit Indian mobile (e.g. "19449157858" = 91 94491 57858).
+        // Indian mobiles start with 6-9, so treat these as Indian rather than international.
+        // Numbers written with an explicit '+' are left alone: the '+' means it was deliberate.
+        if (!raw.trimStart().startsWith("+") &&
+            digits.length == 11 &&
+            (digits[0] == '1' || digits[0] == '9') &&
+            digits[1] in '6'..'9'
+        ) {
+            digits = digits.substring(1)
+        }
+
         return when {
             digits.length == 10 -> "+91$digits"
             digits.length in 11..15 -> "+$digits"
