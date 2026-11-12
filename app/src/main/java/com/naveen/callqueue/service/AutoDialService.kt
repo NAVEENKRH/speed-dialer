@@ -67,6 +67,9 @@ class AutoDialService : Service() {
     private var postCallJob: Job? = null
     private var lastDialStartedAtMillis = 0L
 
+    // Set when the user taps Resume while a call is still in progress; dialing restarts once it ends.
+    private var resumeWhenCallEnds = false
+
     private val _state = MutableStateFlow(DialSessionState())
     val state: StateFlow<DialSessionState> = _state
 
@@ -108,13 +111,39 @@ class AutoDialService : Service() {
 
     fun hold() {
         postCallJob?.cancel()
-        _state.value = _state.value.copy(phase = SessionPhase.HELD, statusMessage = "Held — tap Resume to continue")
+        resumeWhenCallEnds = false
+        _state.value = _state.value.copy(
+            phase = SessionPhase.HELD,
+            statusMessage = "Held — tap Resume to continue",
+            countdownSeconds = null
+        )
         updateNotification("Held")
     }
 
     fun resumeSession() {
         if (_state.value.phase != SessionPhase.HELD) return
-        serviceScope.launch { runNext() }
+        // A call is still going on (e.g. an incoming call taken while held): don't dial over it.
+        // Remember the user's Resume and start dialing as soon as that call ends.
+        if (lastCallState != CallStateWatcher.STATE_IDLE) {
+            resumeWhenCallEnds = true
+            _state.value = _state.value.copy(statusMessage = "Will resume when the current call ends")
+            return
+        }
+        serviceScope.launch { continueAfterHold() }
+    }
+
+    /**
+     * Picks the session back up after a hold. If the hold interrupted a lead mid-call or mid-countdown,
+     * that lead is still marked CALLING; close it off as done (same as the auto-advance would have)
+     * so it doesn't get stuck in the list, then move on to the next number.
+     */
+    private suspend fun continueAfterHold() {
+        resumeWhenCallEnds = false
+        val current = _state.value.current
+        if (current != null && current.status == EntryStatus.CALLING) {
+            replaceEntry(current.id) { it.copy(status = EntryStatus.DONE) }
+        }
+        runNext()
     }
 
     fun skip() {
@@ -155,6 +184,7 @@ class AutoDialService : Service() {
 
     fun stopSession() {
         postCallJob?.cancel()
+        resumeWhenCallEnds = false
         callStateWatcher.stop()
         _state.value = DialSessionState()
         // Drop the foreground/notification but keep the service alive and bound, ready for
@@ -202,6 +232,16 @@ class AutoDialService : Service() {
         val previous = lastCallState
         lastCallState = newState
 
+        // While held, calls on the phone (incoming calls, or the user's own) must not touch the
+        // session at all: no switching to "On call", and no post-call countdown that would start
+        // dialing again. Only an explicit Resume restarts the queue.
+        if (_state.value.phase == SessionPhase.HELD) {
+            if (newState == CallStateWatcher.STATE_IDLE && resumeWhenCallEnds) {
+                serviceScope.launch { continueAfterHold() }
+            }
+            return
+        }
+
         when (newState) {
             CallStateWatcher.STATE_OFFHOOK -> {
                 if (previous != CallStateWatcher.STATE_OFFHOOK) {
@@ -227,6 +267,8 @@ class AutoDialService : Service() {
      */
     private suspend fun handleCallEnded() {
         val current = _state.value.current ?: return
+        // Hold may have been tapped in the instant between the call ending and this running.
+        if (_state.value.phase == SessionPhase.HELD) return
 
         _state.value = _state.value.copy(
             phase = SessionPhase.AWAITING_TAG,
